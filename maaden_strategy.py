@@ -92,8 +92,16 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     stop is hit (handled in backtest loop).
     """
     trend_up = df["sma_fast"] > df["sma_slow"]
-    cross_up = trend_up & ~trend_up.shift(1).fillna(False)
-    cross_down = ~trend_up & trend_up.shift(1).fillna(False)
+    # shift(1, fill_value=False) keeps bool dtype. shift(1).fillna(False) silently
+    # upcasts to object dtype (to hold the leading NaN), and Python's `~` on an
+    # object-dtype True/False does BITWISE negation (~True == -2, ~False == -1),
+    # not logical negation - this previously made cross_up fire on ~43% of all
+    # days instead of only on real crossovers. Confirmed the bug and the fix by
+    # cross-checking against a from-scratch C++ port, which used plain bool
+    # logic and never hit this pandas dtype trap.
+    prev_trend_up = trend_up.shift(1, fill_value=False)
+    cross_up = trend_up & ~prev_trend_up
+    cross_down = ~trend_up & prev_trend_up
 
     df["entry_signal"] = cross_up & (df["rsi"] < RSI_MAX_ENTRY)
     df["exit_signal"] = cross_down

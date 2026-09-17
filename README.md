@@ -1,42 +1,43 @@
 # خوارزمية تداول (Trading Algorithm) — Maaden (Tadawul: 1211)
 
-A daily-timeframe trading algorithm for **Saudi Arabian Mining Co. (Maaden, 1211.SR)**, built and backtested in Python against Yahoo Finance data.
+A daily-timeframe trading algorithm for **Saudi Arabian Mining Co. (Maaden, 1211.SR)**, backtested against Yahoo Finance data. Implemented in both Python ([`maaden_strategy.py`](maaden_strategy.py)) and C++ ([`maaden_strategy.cpp`](maaden_strategy.cpp)), which are cross-checked against each other to produce bit-identical results.
 
-## Summary
+## Strategy
 
-The final strategy in [`maaden_strategy.py`](maaden_strategy.py) is a **long-only SMA crossover system with an RSI entry filter and a trailing stop**:
+Long-only **SMA crossover with an RSI entry filter and a trailing stop**:
 
 - **Entry**: 10-day SMA crosses above the 30-day SMA, and RSI(14) is below 85 (avoids buying into a blow-off top).
 - **Exit**: 10-day SMA crosses back below the 30-day SMA (trend reversal), or price falls 8% from its peak since entry (trailing stop — cuts losers fast, lets winners run).
 - Long-only, since Tadawul has no retail short-selling. 0.1% commission modeled per trade.
 
-### Why these specific rules
+## A signal-generation bug was found and fixed (important)
 
-This version survived a search of roughly **1,300 parameter combinations across four different rule families**, each evaluated on three separate time windows (2018–2026, 2025–2026, 2024–2026) so no result could be cherry-picked from a single lucky period:
+An earlier version of `maaden_strategy.py` computed the crossover entry signal as:
 
-| Approach | 2018–2026 | 2025–2026 | 2024–2026 |
-|---|---|---|---|
-| Fixed 4% stop-loss / 8% take-profit + RSI exit | +50% | +3% | **−12% (loss)** |
-| **SMA crossover + RSI filter + 8% trailing stop (kept)** | **+161%** | **+22%** | **+18%** |
-| + long-term (100–200 day) trend regime filter | +165% | +8% | +15% |
-| Stay-invested by default + crash guard on confirmed breakdown | +203% | +4% | −6% |
-| Buy & hold (reference) | +258% | +23% | +24% |
+```python
+cross_up = trend_up & ~trend_up.shift(1).fillna(False)
+```
 
-The kept version is the only one that was profitable in **every** window tested without ever going negative.
+`trend_up.shift(1)` introduces a leading `NaN`, which silently upcasts the boolean Series to `object` dtype. Python's `~` on an `object`-dtype `True`/`False` does **bitwise** negation (`~True == -2`, `~False == -1`), not logical negation — so `cross_up` fired on ~43% of all days instead of only on genuine crossovers (roughly 2%). This was caught by cross-checking against the independently-written C++ port, which used plain `bool` logic and never hit this pandas dtype trap; the two implementations disagreed until the Python bug was fixed.
 
-### Honest limitation
+**Fix**: `trend_up.shift(1, fill_value=False)` preserves `bool` dtype and avoids the trap. Both implementations now produce identical output for the same input data.
 
-**It does not beat plain buy-and-hold on raw return in any window tested.** Maaden's price history in this dataset shows a strong, low-drawdown uptrend with shallow pullbacks — exactly the environment where active signal-based trading pays commission and whipsaw costs without a crash to earn them back. A backtest describes the past; it is not a promise about the future.
+This means earlier performance figures generated during development (multi-hundred-combination parameter searches across several rule variants) were computed with the over-firing signal and are no longer trustworthy. Only the numbers below, generated after the fix, should be relied on.
 
-## Scenario results (illustrative, from the same backtests)
+## Verified results (post-fix)
 
-| Scenario | Strategy profit | Buy & hold profit |
+| Scenario | Strategy | Buy & hold |
 |---|---|---|
-| 990 SAR lump sum, 2025 → 2026-09 | +214 SAR (+21.6%) | +225 SAR (+22.7%) |
-| 990 SAR lump sum, 2024 → 2026-09 | +173 SAR (+17.5%) | +235 SAR (+23.7%) |
-| 990 SAR/month DCA, 2024 → 2026-09 (33 contributions, 32,670 SAR invested) | +3,929 SAR (+12.0%) | +5,663 SAR (+17.3%) |
+| 100,000 SAR lump sum, 2018 → 2026-09 | +138.7% (44 trades, Sharpe 0.59, max DD −45.9%) | +258.4% |
+| 990 SAR lump sum, 2025 → 2026-09 | **+27.5%** (9 trades) | +22.7% — **strategy wins** |
+| 990 SAR lump sum, 2024 → 2026-09 | +23.4% (14 trades) | +23.7% — essentially tied |
+| 990 SAR/month DCA, 2024 → 2026-09 (33 contributions, 32,670 SAR invested) | +17.0% (14 trades, 35.7% win rate) | +17.3% — essentially tied |
+
+Over the full 2018-2026 history the strategy still trails buy-and-hold by a wide margin (Maaden's long-run trend has been too clean and low-drawdown for signal timing to beat just holding). But over the more recent windows, the corrected strategy is much more competitive than the pre-fix numbers suggested — it even edges ahead over 2025-2026. A backtest describes the past; it is not a promise about the future.
 
 ## Usage
+
+### Python
 
 ```bash
 pip install -r requirements.txt
@@ -45,7 +46,7 @@ pip install -r requirements.txt
 python maaden_strategy.py
 ```
 
-For lump-sum or monthly-DCA scenarios with custom capital/dates, import the module functions directly, e.g.:
+For lump-sum or monthly-DCA scenarios with custom capital/dates, import the module functions directly:
 
 ```python
 import maaden_strategy as m
@@ -58,6 +59,27 @@ result = m.backtest(df)  # uses m.INITIAL_CAPITAL
 # Monthly DCA
 m.dca_scenario(m.TICKER, "2024-01-01", monthly_amount=990)
 ```
+
+### C++
+
+The C++ port reads price data from a CSV (`Date,Close`) rather than fetching it directly — export one from Python first, then build and run:
+
+```bash
+python -c "
+import maaden_strategy as m
+df = m.fetch_data(m.TICKER, '2024-01-01')
+out = df.reset_index()[['Date','Close']]
+out['Date'] = out['Date'].dt.strftime('%Y-%m-%d')
+out.to_csv('data_1211SR.csv', index=False)
+"
+
+g++ -O2 -std=c++17 -static -static-libgcc -static-libstdc++ -o maaden_strategy maaden_strategy.cpp
+./maaden_strategy data_1211SR.csv 990
+```
+
+(`-static -static-libgcc -static-libstdc++` avoids crashes from mismatched `libstdc++` DLLs if more than one MinGW toolchain is on `PATH`, e.g. Git for Windows bundles its own.)
+
+`data_1211SR.csv` (2024-01-01 onward) is included in this repo so the C++ version can be run without Python installed.
 
 ## Disclaimer
 
